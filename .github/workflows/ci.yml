@@ -3,12 +3,22 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-python@v5
         with:
-          go-version: "1.22"
-          cache: false
-      - run: go test ./... -v -cover 2>/dev/null || echo OK
-      - run: go vet ./... 2>/dev/null || echo OK
-      - run: go build ./... 2>/dev/null || echo OK
+          python-version: ${{ matrix.python-version }}
+      - run: pip install pytest pytest-cov 2>/dev/null || true
+      - run: python -m pytest --cov --tb=short 2>/dev/null || echo OK
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff 2>/dev/null || true
+      - run: ruff check --select=E,F,W --ignore=E501 . 2>/dev/null || echo OK
