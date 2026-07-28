@@ -15,7 +15,7 @@ type PoolStats struct {
 	AcquiredConns int32
 	MaxConns      int32
 	WaitCount     int64
-	WaitDuration  time.Duration
+	WaitDuration  int64 // microseconds, accessed atomically
 	AcquireCount  int64
 	CanceledCount int64
 }
@@ -38,6 +38,7 @@ type Pool struct {
 	nextID   int32
 	closed   bool
 	stats    PoolStats
+	waitDur  int64 // atomic: accumulated wait time in microseconds
 }
 
 // NewPool creates a pool with the given maximum size.
@@ -71,7 +72,7 @@ func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 	if p.size < p.maxSize {
 		p.size++
 		conn := &Conn{
-			id:        atomic.AddInt32(&p.nextID, 1),
+			id:        int(atomic.AddInt32(&p.nextID, 1)),
 			createdAt: time.Now(),
 		}
 		p.acquired[conn] = true
@@ -86,32 +87,32 @@ func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 	atomic.AddInt64(&p.stats.WaitCount, 1)
 	waitStart := time.Now()
 
-	// Track that we're a waiter so we can clean up on cancellation
-	// Use a channel-based approach that avoids the race condition
+	// Channel-based waiter with context support
 	done := make(chan struct{})
 	var conn *Conn
 	var acquireErr error
 
 	go func() {
-		defer close(done)
+		p.mu.Lock()
 		for len(p.idle) == 0 && p.size >= p.maxSize && !p.closed {
-			// Check context before sleeping
 			select {
 			case <-ctx.Done():
+				p.mu.Unlock()
+				close(done)
 				return
 			default:
 			}
 			p.cond.Wait()
-			// After waking, check context again
 			select {
 			case <-ctx.Done():
+				p.mu.Unlock()
+				close(done)
 				return
 			default:
 			}
 		}
 		if p.closed {
 			acquireErr = fmt.Errorf("pool is closed")
-			return
 		}
 		if len(p.idle) > 0 {
 			conn = p.idle[len(p.idle)-1]
@@ -120,21 +121,15 @@ func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 			atomic.AddInt32(&p.stats.AcquiredConns, 1)
 			atomic.AddInt64(&p.stats.AcquireCount, 1)
 		}
+		p.mu.Unlock()
+		close(done)
 	}()
 
-	// Wait for either: connection acquired, context cancelled, or pool closed
 	p.mu.Unlock()
 
 	select {
 	case <-done:
-		// Connection acquired or pool closed
-		p.mu.Lock()
-		// Signal next waiter if we got a connection and there's capacity
-		if conn != nil {
-			p.cond.Signal()
-		}
-		atomic.AddInt64(&p.stats.WaitDuration, time.Since(waitStart).Microseconds())
-		p.mu.Unlock()
+		atomic.AddInt64(&p.waitDur, time.Since(waitStart).Microseconds())
 		if acquireErr != nil {
 			return nil, acquireErr
 		}
@@ -144,12 +139,7 @@ func (p *Pool) Acquire(ctx context.Context) (*Conn, error) {
 		return conn, nil
 
 	case <-ctx.Done():
-		// Context cancelled — clean up waiter state
-		p.mu.Lock()
 		atomic.AddInt64(&p.stats.CanceledCount, 1)
-		// Signal next waiter in case we were holding the queue
-		p.cond.Signal()
-		p.mu.Unlock()
 		return nil, fmt.Errorf("acquire canceled: %w", ctx.Err())
 	}
 }
@@ -186,7 +176,7 @@ func (p *Pool) Stats() PoolStats {
 		AcquiredConns: atomic.LoadInt32(&p.stats.AcquiredConns),
 		MaxConns:      p.maxSize,
 		WaitCount:     atomic.LoadInt64(&p.stats.WaitCount),
-		WaitDuration:  time.Duration(atomic.LoadInt64(&p.stats.WaitDuration)) * time.Microsecond,
+		WaitDuration:  atomic.LoadInt64(&p.waitDur),
 		AcquireCount:  atomic.LoadInt64(&p.stats.AcquireCount),
 		CanceledCount: atomic.LoadInt64(&p.stats.CanceledCount),
 	}
